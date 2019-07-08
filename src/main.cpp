@@ -3,6 +3,7 @@
 #include <iostream>
 #include <string>
 #include <vector>
+#include <cmath>
 #include "Eigen-3.3/Eigen/Core"
 #include "Eigen-3.3/Eigen/QR"
 #include "helpers.h"
@@ -13,6 +14,35 @@
 using nlohmann::json;
 using std::string;
 using std::vector;
+
+enum LaneState {
+  STAY = 0,
+  WAIT = 1
+};
+
+enum SpeedState {
+  FULL = 0,
+  MATCH = 1
+};
+
+double get_sensor_fusion_speed(vector<double> sensor_fusion) {
+  return distance(0, 0, sensor_fusion[3], sensor_fusion[4]);
+}
+
+double get_sensor_fusion_future_position(vector<double> sensor_fusion, int prev_size) {
+  return sensor_fusion[5] + (double) prev_size * 0.02 * get_sensor_fusion_speed(sensor_fusion);
+}
+
+int get_sensor_fusion_lane(vector<double> sensor_fusion) {
+  return std::round((sensor_fusion[6] - 2) / 4.0);
+}
+
+double min(double a, double b) {
+  if (a < b) {
+    return a;
+  }
+  return b;
+}
 
 int main() {
   uWS::Hub h;
@@ -50,8 +80,13 @@ int main() {
     map_waypoints_dx.push_back(d_x);
     map_waypoints_dy.push_back(d_y);
   }
+  
+  int lane = 1;
+  double velocity_mph = 0.0;
+  LaneState lane_state = LaneState::STAY;
+  SpeedState speed_state = SpeedState::FULL;
 
-  h.onMessage([&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,
+  h.onMessage([&velocity_mph,&lane,&lane_state,&speed_state,&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,
                &map_waypoints_dx,&map_waypoints_dy]
               (uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
                uWS::OpCode opCode) {
@@ -92,10 +127,95 @@ int main() {
           auto sensor_fusion = j[1]["sensor_fusion"];
 
           json msgJson;
+          
+          //
+          // CONTROL
+          //
+          
+          // adjust target speed and lanes based on sensor fusion data
+          double current_s = car_s;
+          if (prev_size > 0) {
+            // Predict where we will be in the future
+            current_s = end_path_s;
+          }
 
-          double target_speed = 49.5 / 2.24; // 49.5 MPH -> meters/sec
-          int target_lane = 1; // Starts in middle lane
-          // [0, 1, 2]
+          double max_acceleration_mph = 0.8;
+          double max_deceleration_mph = -0.8;
+          double speed_adjustment_mph = max_acceleration_mph;
+          
+          // Find obstacles
+          for (int i = 0; i < sensor_fusion.size(); i++) {
+            std::cout << "sensor_fusion_lane: " << get_sensor_fusion_lane(sensor_fusion[i]) << std::endl;
+            if (  // In my lane
+              get_sensor_fusion_lane(sensor_fusion[i]) == lane
+            ) {
+              double obj_speed = get_sensor_fusion_speed(sensor_fusion[i]);
+              double check_obj_s = get_sensor_fusion_future_position(sensor_fusion[i], prev_size);
+
+              std::cout << "obj_speed: " << obj_speed << std::endl;
+              std::cout << "check_obj_s: " << check_obj_s << std::endl;
+              std::cout << "current_s: " << current_s << std::endl;
+              if (
+                // Is in front of me
+                check_obj_s > current_s
+              ) {
+                
+                // Is relatively close
+                if ((check_obj_s - current_s) < 30) {
+                  // Consider lane change when you can
+                  lane_state = LaneState::WAIT;
+                  // Match speed
+                  speed_state = SpeedState::MATCH;
+                }
+
+                if (speed_state == SpeedState::MATCH) {
+                  double adj = ((obj_speed * 2.24) - velocity_mph);
+                  // Match the slowest object in our lane and ahead of us (and in sensor fusion range)
+                  if (velocity_mph + adj < velocity_mph + speed_adjustment_mph) {
+                    speed_adjustment_mph = adj;
+                  }
+                }
+
+              }
+            }
+          }
+          
+          // Find gap to merge into
+          if (lane_state == LaneState::WAIT) {
+            // Pick best option: left, right, or stay
+            // TODO(jafulfor): Do better cost functions here
+            bool left_lane_better = lane != 0;
+            bool right_lane_better = lane != 2; // Assuming 3 lanes!
+            for(int i = 0; i < sensor_fusion.size(); i++) {
+              // TODO(jafulfor): Eliminate left or right lanes
+            }
+
+            // Prefer left lane over right lane (in theory left lane is faster)
+            if (left_lane_better) {
+              lane -= 1;
+              lane_state = LaneState::STAY;
+              speed_state = SpeedState::FULL;
+            } else if (right_lane_better) {
+              lane += 1;
+              lane_state = LaneState::STAY;
+              speed_state = SpeedState::FULL;
+            }
+          }
+
+          // Speed pacing (jerk)
+          speed_adjustment_mph = min(speed_adjustment_mph, max_acceleration_mph);
+          // Brake pacing (jerk)
+          speed_adjustment_mph = min(-speed_adjustment_mph, -max_deceleration_mph);
+          
+          // Enforce max speed
+          velocity_mph = min(velocity_mph + speed_adjustment_mph, 49.5);
+          
+          std::cout << "velocity_mph: " << velocity_mph << ", lane: " << lane << std::endl;
+          std::cout << "lane_state: " << lane_state << ", speed_state: " << speed_state << std::endl;
+          
+          //
+          // PLOT WAYPOINTS
+          //
 
           // Define anchor points
           vector<double> pts_x;
@@ -104,8 +224,8 @@ int main() {
           double ref_x;
           double ref_y;
           double ref_yaw;
+          // Add initial waypoints for current projected position
           if (prev_size < 2) {
-            std::cout << "prev_size is low" << std::endl;
             pts_x.push_back(car_x - cos(car_yaw));
             pts_y.push_back(car_y - sin(car_yaw));
 
@@ -130,18 +250,17 @@ int main() {
             pts_y.push_back(ref_y);
           }
           
-          
+          // Compute future waypoints
           vector<double> next_waypoint;
           for (int i = 1; i < 4; i++) {
             next_waypoint = getXY(
               car_s + (i * 30),
-              2 + (4 * target_lane),
+              2 + (4 * lane),
               map_waypoints_s, map_waypoints_x, map_waypoints_y
             );
             pts_x.push_back(next_waypoint[0]);
             pts_y.push_back(next_waypoint[1]);
           }
-          std::cout << "inferred waypoints: " << pts_x.size() << std::endl;
           
           // Rotate pts to ref's perspective
           for (int i = 0; i < pts_x.size(); i++) {
@@ -150,7 +269,10 @@ int main() {
             pts_x[i] = shift_x * cos(0 - ref_yaw) - shift_y * sin(0 - ref_yaw);
             pts_y[i] = shift_x * sin(0 - ref_yaw) + shift_y * cos(0 - ref_yaw);
           }
-          std::cout << "shifted to local coords" << std::endl;
+          
+          //
+          // INTERPOLATE ACTIONS
+          //
           
           tk::spline path;
           
@@ -163,13 +285,12 @@ int main() {
             next_x_vals.push_back(previous_path_x[i]);
             next_y_vals.push_back(previous_path_y[i]);
           }
-          std::cout << "prev_size is " << prev_size << std::endl;
           
           double target_x = 30.0;
           double target_y = path(target_x);
           double target_d = distance(0, 0, target_x, target_y);
           // How many chunks needed to cover distance given target speed and chunk time is 0.02 seconds?
-          double N = target_d / (0.02 * target_speed);
+          double N = target_d / (0.02 * velocity_mph / 2.24);
 
           // Can't make it all the way, but squeeze in as many points as you can
           for (int i = 0; i < 50 - prev_size; i++) {
@@ -201,10 +322,10 @@ int main() {
           msgJson["next_y"] = next_y_vals;
 
           auto msg = "42[\"control\","+ msgJson.dump()+"]";
-          for(int i = 0; i < next_x_vals.size(); i++) {
-            std::cout << i << ": (" << next_x_vals[i] << ", " << next_y_vals[i] << ")" << std::endl;
-          }
-          std::cout << "Sending response with points.size() " << next_x_vals.size() <<  std::endl;
+//           for(int i = 0; i < next_x_vals.size(); i++) {
+//             std::cout << i << ": (" << next_x_vals[i] << ", " << next_y_vals[i] << ")" << std::endl;
+//           }
+//           std::cout << "Sending response with points.size() " << next_x_vals.size() <<  std::endl;
 
           ws.send(msg.data(), msg.length(), uWS::OpCode::TEXT);
         }  // end "telemetry" if
