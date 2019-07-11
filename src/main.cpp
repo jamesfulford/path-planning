@@ -135,7 +135,7 @@ double cost_of_lane(int lane, vector<vector<double>> sensor_fusion, double curre
     // Short circuit
     return Cost::ILLEGAL;
   }
-  
+
   bool blocked_ahead = false;
   vector<vector<double>> objects_in_this_lane = objects_in_lane(
     filter_min_s(
@@ -215,7 +215,7 @@ int main() {
     map_waypoints_dx.push_back(d_x);
     map_waypoints_dy.push_back(d_y);
   }
-  
+
   int lane = 1;
   double velocity_mph = 0.0;
 
@@ -234,7 +234,7 @@ int main() {
         auto j = json::parse(s);
 
         string event = j[0].get<string>();
-        
+
         if (event == "telemetry") {
           // j[1] is the data JSON object
 
@@ -251,11 +251,11 @@ int main() {
           auto previous_path_y = j[1]["previous_path_y"];
           int prev_size = previous_path_x.size();
 
-          // Previous path's end s and d values 
+          // Previous path's end s and d values
           double end_path_s = j[1]["end_path_s"];
           double end_path_d = j[1]["end_path_d"];
 
-          // Sensor Fusion Data, a list of all other cars on the same side 
+          // Sensor Fusion Data, a list of all other cars on the same side
           //   of the road.
           auto sensor_fusion = j[1]["sensor_fusion"];
 
@@ -294,13 +294,15 @@ int main() {
           );
           double speed_adjustment_mph = target_speed - velocity_mph;
 
+          //
           // Decide lane
+          //
+          // Shift left
           double left_cost = cost_of_lane(lane - 1, sensor_fusion, current_s, prev_size, max_s) + Cost::RELUCTANCE;
-          std::cout << "left_cost: " << left_cost << std::endl;
+          // Stay
           double middle_cost = cost_of_lane(lane, sensor_fusion, current_s, prev_size, max_s);
-          std::cout << "middle_cost: " << middle_cost << std::endl;
+          // Shift right
           double right_cost = cost_of_lane(lane + 1, sensor_fusion, current_s, prev_size, max_s) + Cost::RELUCTANCE;
-          std::cout << "right_cost: " << right_cost << std::endl;
 
           if (
             left_cost < middle_cost
@@ -329,7 +331,7 @@ int main() {
           // Define anchor points
           vector<double> pts_x;
           vector<double> pts_y;
-          
+
           double ref_x;
           double ref_y;
           double ref_yaw;
@@ -340,26 +342,26 @@ int main() {
 
             pts_x.push_back(car_x);
             pts_y.push_back(car_y);
-            
+
             ref_x = car_x;
             ref_y = car_y;
             ref_yaw = car_yaw;
           } else {
             ref_x = previous_path_x[prev_size - 1];
             ref_y = previous_path_y[prev_size - 1];
-            
+
             double ref_x_prev = previous_path_x[prev_size - 2];
             double ref_y_prev = previous_path_y[prev_size - 2];
 
             ref_yaw = atan2(ref_y - ref_y_prev, ref_x - ref_x_prev);
-            
+
             pts_x.push_back(ref_x_prev);
             pts_y.push_back(ref_y_prev);
 
             pts_x.push_back(ref_x);
             pts_y.push_back(ref_y);
           }
-          
+
           // Compute future waypoints
           vector<double> next_waypoint;
           for (int i = 1; i < 4; i++) {
@@ -379,15 +381,15 @@ int main() {
             pts_x[i] = shift_x * cos(0 - ref_yaw) - shift_y * sin(0 - ref_yaw);
             pts_y[i] = shift_x * sin(0 - ref_yaw) + shift_y * cos(0 - ref_yaw);
           }
-          
+
           //
           // INTERPOLATE ACTIONS
           //
-          
+
           tk::spline path;
-          
+
           path.set_points(pts_x, pts_y);
-          
+
           vector<double> next_x_vals;
           vector<double> next_y_vals;
 
@@ -395,7 +397,7 @@ int main() {
             next_x_vals.push_back(previous_path_x[i]);
             next_y_vals.push_back(previous_path_y[i]);
           }
-          
+
           double target_x = 30.0;
           double target_y = path(target_x);
           double target_d = distance(0, 0, target_x, target_y);
@@ -403,7 +405,7 @@ int main() {
           double N = target_d / (0.02 * velocity_mph / 2.24);
 
           // Can't make it all the way, but squeeze in as many points as you can
-          
+
           for (int i = 0; i < 50 - prev_size; i++) {
             double x = (target_x / N) * (i + 1);
             double y = path(x);
@@ -447,6 +449,6 @@ int main() {
     std::cerr << "Failed to listen to port" << std::endl;
     return -1;
   }
-  
+
   h.run();
 }
