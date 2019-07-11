@@ -29,8 +29,12 @@ double get_sensor_fusion_speed(vector<double> sensor_fusion) {
   return distance(0, 0, sensor_fusion[3], sensor_fusion[4]);
 }
 
+double get_sensor_fusion_s(vector<double> sensor_fusion) {
+  return sensor_fusion[5];
+}
+
 double get_sensor_fusion_future_position(vector<double> sensor_fusion, int prev_size) {
-  return sensor_fusion[5] + (double) prev_size * 0.02 * get_sensor_fusion_speed(sensor_fusion);
+  return get_sensor_fusion_s(sensor_fusion) + (double) prev_size * 0.02 * get_sensor_fusion_speed(sensor_fusion);
 }
 
 int get_sensor_fusion_lane(vector<double> sensor_fusion) {
@@ -42,6 +46,137 @@ double min(double a, double b) {
     return a;
   }
   return b;
+}
+
+bool is_ahead_of (double them, double me, double total) {
+  // TODO(jafulfor): Fix to account for wrap-around
+  return (me - them) < 0;
+}
+
+enum Cost {
+  // In terms of MPH
+  ILLEGAL = 2048, // off-road
+  BLOCKED = 1024, // close to my position (I'm potentially already in the lane)
+  BLOCKED_AHEAD = 8, // will be behind another car
+  RIGHT = 0, // penalty for how many lanes to the right (prefer left lanes)
+  RELUCTANCE = 3, // penalty if lane is not current lane
+
+  OPTION_BONUS = 6 // bonus per lane shift option lane provides
+};
+
+bool is_lane_legal (int lane) {
+  return (lane < 3 && lane >= 0);
+}
+
+double lane_shift_option_bonus (int lane) {
+  return (
+    // add 1 if left lane is legal
+    is_lane_legal(lane - 1) ? Cost::OPTION_BONUS : 0
+    // add 1 if right lane is legal
+    + is_lane_legal(lane + 1) ? Cost::OPTION_BONUS : 0
+  );
+}
+
+double rightness_penalty (int lane) {
+  return lane * Cost::RIGHT;
+}
+
+vector<vector<double>> objects_in_lane(vector<vector<double>> sensor_fusion, int lane) {
+  vector<vector<double>> relevant;
+  for (int i = 0; i < sensor_fusion.size(); i++) {
+    if (
+      get_sensor_fusion_lane(sensor_fusion[i]) == lane
+    ) {
+      relevant.push_back(sensor_fusion[i]);
+    }
+  }
+  return relevant;
+}
+
+vector<vector<double>> filter_min_s (vector<vector<double>> sensor_fusion, double min_s, int steps_into_future, double max_s) {
+  vector<vector<double>> relevant;
+  for (int i = 0; i < sensor_fusion.size(); i++) {
+    double sf_s = get_sensor_fusion_future_position(sensor_fusion[i], steps_into_future);
+    if (
+      is_ahead_of(sf_s, min_s, max_s)
+    ) {
+      relevant.push_back(sensor_fusion[i]);
+    }
+  }
+  return relevant;
+}
+
+vector<vector<double>> filter_max_s (vector<vector<double>> sensor_fusion, double top_s, int steps_into_future, double max_s) {
+  vector<vector<double>> relevant;
+  for (int i = 0; i < sensor_fusion.size(); i++) {
+    double sf_s = get_sensor_fusion_future_position(sensor_fusion[i], steps_into_future);
+    if (
+      is_ahead_of(top_s, sf_s, max_s)
+    ) {
+      relevant.push_back(sensor_fusion[i]);
+    }
+  }
+  return relevant;
+}
+
+double min_speed_in_lane(vector<vector<double>> sensor_fusion) {
+  double min_speed = 49.5;
+  for (int i = 0; i < sensor_fusion.size(); i++) {
+    min_speed = min(min_speed, get_sensor_fusion_speed(sensor_fusion[i]));
+  }
+  return min_speed;
+}
+
+double cost_of_lane(int lane, vector<vector<double>> sensor_fusion, double current_s, int steps_into_future, double max_s) {
+  double cost = 0.0;
+
+  // ILLEGAL exit
+  if (!is_lane_legal(lane)) {
+    // Short circuit
+    return Cost::ILLEGAL;
+  }
+  
+  bool blocked_ahead = false;
+  vector<vector<double>> objects_in_this_lane = objects_in_lane(
+    filter_min_s(
+      filter_max_s(
+        sensor_fusion,
+        current_s + 100.0,
+        steps_into_future,
+        max_s
+      ),
+      current_s - 15.0,
+      steps_into_future,
+      max_s
+    ),
+    lane
+  );
+  for (int i = 0; i < objects_in_this_lane.size(); i++) {
+    double sf_s = get_sensor_fusion_future_position(objects_in_this_lane[i], steps_into_future);
+    // BLOCKED exit
+    if (
+      // Me + 25 is ahead of them (they are closer than 25 ahead)
+      is_ahead_of(current_s + 15.0, sf_s, max_s)
+      // They are ahead of me - 15 (they are closer than 15 behind)
+      && is_ahead_of(sf_s, current_s - 10.0, max_s)
+    ) {
+      // Short circuit
+      return Cost::BLOCKED;
+    }
+
+    blocked_ahead = blocked_ahead || (
+      is_ahead_of(sf_s, current_s, max_s)
+      && !is_ahead_of(sf_s, current_s + 50.0, max_s)
+    );
+  }
+
+  cost += blocked_ahead ? Cost::BLOCKED_AHEAD : 0; // penalize lanes that have cars close ahead
+  cost += rightness_penalty(lane); // prefer left lanes
+
+  cost -= min_speed_in_lane(objects_in_this_lane); // reward lanes where I can go faster
+  cost -= lane_shift_option_bonus(lane); // reward lanes where I get more switching options
+
+  return cost;
 }
 
 int main() {
@@ -83,10 +218,8 @@ int main() {
   
   int lane = 1;
   double velocity_mph = 0.0;
-  LaneState lane_state = LaneState::STAY;
-  SpeedState speed_state = SpeedState::FULL;
 
-  h.onMessage([&velocity_mph,&lane,&lane_state,&speed_state,&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,
+  h.onMessage([&max_s,&velocity_mph,&lane,&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,
                &map_waypoints_dx,&map_waypoints_dy]
               (uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
                uWS::OpCode opCode) {
@@ -99,12 +232,12 @@ int main() {
 
       if (s != "") {
         auto j = json::parse(s);
-        
+
         string event = j[0].get<string>();
         
         if (event == "telemetry") {
           // j[1] is the data JSON object
-          
+
           // Main car's localization Data
           double car_x = j[1]["x"];
           double car_y = j[1]["y"];
@@ -127,11 +260,11 @@ int main() {
           auto sensor_fusion = j[1]["sensor_fusion"];
 
           json msgJson;
-          
+
           //
           // CONTROL
           //
-          
+
           // adjust target speed and lanes based on sensor fusion data
           double current_s = car_s;
           if (prev_size > 0) {
@@ -141,78 +274,54 @@ int main() {
 
           double max_acceleration_mph = 0.8;
           double max_deceleration_mph = -0.8;
-          double speed_adjustment_mph = max_acceleration_mph;
-          
-          // Find obstacles
-          for (int i = 0; i < sensor_fusion.size(); i++) {
-            std::cout << "sensor_fusion_lane: " << get_sensor_fusion_lane(sensor_fusion[i]) << std::endl;
-            if (  // In my lane
-              get_sensor_fusion_lane(sensor_fusion[i]) == lane
-            ) {
-              double obj_speed = get_sensor_fusion_speed(sensor_fusion[i]);
-              double check_obj_s = get_sensor_fusion_future_position(sensor_fusion[i], prev_size);
 
-              std::cout << "obj_speed: " << obj_speed << std::endl;
-              std::cout << "check_obj_s: " << check_obj_s << std::endl;
-              std::cout << "current_s: " << current_s << std::endl;
-              if (
-                // Is in front of me
-                check_obj_s > current_s
-              ) {
-                
-                // Is relatively close
-                if ((check_obj_s - current_s) < 30) {
-                  // Consider lane change when you can
-                  lane_state = LaneState::WAIT;
-                  // Match speed
-                  speed_state = SpeedState::MATCH;
-                }
+          // Match speed
+          double target_speed = min_speed_in_lane(
+            objects_in_lane(
+              filter_min_s(
+                filter_max_s(
+                  sensor_fusion,
+                  current_s + 30.0,
+                  prev_size,
+                  max_s
+                ),
+                current_s, // don't match speed of objects behind you!
+                prev_size,
+                max_s
+              ),
+              lane
+            )
+          );
+          double speed_adjustment_mph = target_speed - velocity_mph;
 
-                if (speed_state == SpeedState::MATCH) {
-                  double adj = ((obj_speed * 2.24) - velocity_mph);
-                  // Match the slowest object in our lane and ahead of us (and in sensor fusion range)
-                  if (velocity_mph + adj < velocity_mph + speed_adjustment_mph) {
-                    speed_adjustment_mph = adj;
-                  }
-                }
+          // Decide lane
+          double left_cost = cost_of_lane(lane - 1, sensor_fusion, current_s, prev_size, max_s) + Cost::RELUCTANCE;
+          std::cout << "left_cost: " << left_cost << std::endl;
+          double middle_cost = cost_of_lane(lane, sensor_fusion, current_s, prev_size, max_s);
+          std::cout << "middle_cost: " << middle_cost << std::endl;
+          double right_cost = cost_of_lane(lane + 1, sensor_fusion, current_s, prev_size, max_s) + Cost::RELUCTANCE;
+          std::cout << "right_cost: " << right_cost << std::endl;
 
-              }
-            }
-          }
-          
-          // Find gap to merge into
-          if (lane_state == LaneState::WAIT) {
-            // Pick best option: left, right, or stay
-            // TODO(jafulfor): Do better cost functions here
-            bool left_lane_better = lane != 0;
-            bool right_lane_better = lane != 2; // Assuming 3 lanes!
-            for(int i = 0; i < sensor_fusion.size(); i++) {
-              // TODO(jafulfor): Eliminate left or right lanes
-            }
-
-            // Prefer left lane over right lane (in theory left lane is faster)
-            if (left_lane_better) {
-              lane -= 1;
-              lane_state = LaneState::STAY;
-              speed_state = SpeedState::FULL;
-            } else if (right_lane_better) {
-              lane += 1;
-              lane_state = LaneState::STAY;
-              speed_state = SpeedState::FULL;
-            }
+          if (
+            left_cost < middle_cost
+            && left_cost < right_cost
+          ) {
+            lane -= 1;
+          } else if (
+            right_cost < left_cost
+            && right_cost < middle_cost
+          ) {
+            lane += 1;
           }
 
           // Speed pacing (jerk)
           speed_adjustment_mph = min(speed_adjustment_mph, max_acceleration_mph);
           // Brake pacing (jerk)
-          speed_adjustment_mph = min(-speed_adjustment_mph, -max_deceleration_mph);
-          
+          speed_adjustment_mph = -min(-speed_adjustment_mph, -max_deceleration_mph);
+
           // Enforce max speed
-          velocity_mph = min(velocity_mph + speed_adjustment_mph, 49.5);
-          
-          std::cout << "velocity_mph: " << velocity_mph << ", lane: " << lane << std::endl;
-          std::cout << "lane_state: " << lane_state << ", speed_state: " << speed_state << std::endl;
-          
+          velocity_mph = min(velocity_mph + (speed_adjustment_mph / 2.24), 49.5);
+
           //
           // PLOT WAYPOINTS
           //
@@ -241,6 +350,7 @@ int main() {
             
             double ref_x_prev = previous_path_x[prev_size - 2];
             double ref_y_prev = previous_path_y[prev_size - 2];
+
             ref_yaw = atan2(ref_y - ref_y_prev, ref_x - ref_x_prev);
             
             pts_x.push_back(ref_x_prev);
@@ -254,14 +364,14 @@ int main() {
           vector<double> next_waypoint;
           for (int i = 1; i < 4; i++) {
             next_waypoint = getXY(
-              car_s + (i * 30),
+              car_s + (i * 45),
               2 + (4 * lane),
               map_waypoints_s, map_waypoints_x, map_waypoints_y
             );
             pts_x.push_back(next_waypoint[0]);
             pts_y.push_back(next_waypoint[1]);
           }
-          
+
           // Rotate pts to ref's perspective
           for (int i = 0; i < pts_x.size(); i++) {
             double shift_x = pts_x[i] - ref_x;
@@ -293,6 +403,7 @@ int main() {
           double N = target_d / (0.02 * velocity_mph / 2.24);
 
           // Can't make it all the way, but squeeze in as many points as you can
+          
           for (int i = 0; i < 50 - prev_size; i++) {
             double x = (target_x / N) * (i + 1);
             double y = path(x);
@@ -303,29 +414,11 @@ int main() {
               (x * sin(ref_yaw) + y * cos(ref_yaw)) + ref_y
             );
           }
-          
-//           vector<double> next_s_vals;
-//           vector<double> next_d_vals;
-//           for (int i = 0; i < 50; i++) {
-//             next_s_vals.push_back(car_s + (i * 0.5));
-//             next_d_vals.push_back(car_d);
-//           }
-          
-//           for (int i = 0; i < next_s_vals.size(); i++) {
-//             vector<double> xy = getXY(next_s_vals[i], next_d_vals[i], map_waypoints_s, map_waypoints_x, map_waypoints_y);
-//             next_x_vals.push_back(xy[0]);
-//             next_y_vals.push_back(xy[1]);
-//           }
-
 
           msgJson["next_x"] = next_x_vals;
           msgJson["next_y"] = next_y_vals;
 
           auto msg = "42[\"control\","+ msgJson.dump()+"]";
-//           for(int i = 0; i < next_x_vals.size(); i++) {
-//             std::cout << i << ": (" << next_x_vals[i] << ", " << next_y_vals[i] << ")" << std::endl;
-//           }
-//           std::cout << "Sending response with points.size() " << next_x_vals.size() <<  std::endl;
 
           ws.send(msg.data(), msg.length(), uWS::OpCode::TEXT);
         }  // end "telemetry" if
